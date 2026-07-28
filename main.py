@@ -1,5 +1,5 @@
 """
-DataMind Chatbot — FastAPI Backend
+Mimi Chatbot — FastAPI Backend
 ====================================
 Run:  uvicorn main:app --reload
 Docs: http://localhost:8000/docs
@@ -18,7 +18,7 @@ from typing import Optional
 # ─────────────────────────────────────────────
 # 1. Create the app
 # ─────────────────────────────────────────────
-app = FastAPI(title="DataMind Chatbot API")
+app = FastAPI(title="Mimi Chatbot API")
 
 # Allow your React frontend (running on port 3000) to talk to this backend
 app.add_middleware(
@@ -57,7 +57,7 @@ class SQLQuery(BaseModel):
 @app.get("/")
 def home():
     """Health check"""
-    return {"status": "DataMind API is running"}
+    return {"status": "Mimi API is running"}
 
 
 @app.post("/chat")
