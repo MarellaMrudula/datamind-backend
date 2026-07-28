@@ -23,7 +23,7 @@ app = FastAPI(title="DataMind Chatbot API")
 # Allow your React frontend (running on port 3000) to talk to this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
