@@ -76,9 +76,10 @@ def chat(body: ChatMessage):
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=(
-            "You are DataMind, a helpful AI data assistant. "
+            "You are Mimi, a helpful AI data assistant. "
             "You help users analyze data, write SQL queries, summarize files, "
             "and answer questions about their datasets. "
+            "Always refer to yourself as Mimi, never DataMind."
             "Be concise and practical."
         ),
         messages=conversation_history
@@ -113,7 +114,7 @@ def chat_stream(body: ChatMessage):
         with client.messages.stream(
             model="claude-sonnet-4-6",
             max_tokens=1024,
-            system="You are DataMind, a helpful AI data assistant.",
+            system="You are Mimi, a helpful AI data assistant.",
             messages=conversation_history
         ) as stream:
             for text in stream.text_stream:
@@ -169,7 +170,7 @@ async def upload_file(file: UploadFile = File(...)):
     conversation_history.append({
         "role": "assistant",
         "content": (
-            f"I can see the uploaded file '{file.filename}'. "
+            f" Mimi can see the uploaded file '{file.filename}'. "
             f"It has {len(df)} rows and {len(df.columns)} columns: "
             f"{', '.join(df.columns)}. Ask me anything about it!"
         )
