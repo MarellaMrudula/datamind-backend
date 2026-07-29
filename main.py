@@ -11,6 +11,8 @@ from pydantic import BaseModel
 import anthropic
 import pandas as pd
 import pymupdf
+import requests
+from bs4 import BeautifulSoup
 import io
 import json
 
@@ -28,9 +30,6 @@ app.add_middleware(
 
 client = anthropic.Anthropic()
 conversation_history = []
-
-# Per-session resume storage (in memory)
-# Key: session_id, Value: extracted resume text
 user_resumes = {}
 
 # ─────────────────────────────────────────────
@@ -49,19 +48,14 @@ class JobURL(BaseModel):
     url: str
     session_id: str = "default"
 
+class JobText(BaseModel):
+    text: str
+    session_id: str = "default"
+
 class CoverLetterRequest(BaseModel):
     job_title: str
     company: str
     summary: str
-    session_id: str = "default"
-
-class ReviewField(BaseModel):
-    field_name: str
-    field_value: str
-
-class ApplicationReview(BaseModel):
-    url: str
-    fields: list[ReviewField]
     session_id: str = "default"
 
 # ─────────────────────────────────────────────
@@ -79,16 +73,10 @@ async def upload_resume(
     file: UploadFile = File(...),
     session_id: str = "default"
 ):
-    """
-    Upload a resume PDF or TXT.
-    Extracts text and stores it for this session.
-    Used for job matching and auto-fill.
-    """
     contents = await file.read()
     resume_text = ""
 
     if file.filename.endswith(".pdf"):
-        # Extract text from PDF using pymupdf
         pdf = pymupdf.open(stream=contents, filetype="pdf")
         for page in pdf:
             resume_text += page.get_text()
@@ -96,21 +84,13 @@ async def upload_resume(
     elif file.filename.endswith(".txt"):
         resume_text = contents.decode("utf-8", errors="ignore")
     else:
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF or TXT resumes are supported"
-        )
+        raise HTTPException(status_code=400, detail="Only PDF or TXT resumes supported")
 
     if not resume_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Could not extract text from resume. Please try a different file."
-        )
+        raise HTTPException(status_code=400, detail="Could not extract text from resume.")
 
-    # Store resume for this session
     user_resumes[session_id] = resume_text.strip()
 
-    # Ask Claude to summarize the resume
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
@@ -130,23 +110,21 @@ async def upload_resume(
         "characters_extracted": len(resume_text),
         "summary": response.content[0].text.strip(),
         "session_id": session_id,
-        "message": "Resume uploaded successfully! I can now calculate your job match score and auto-fill applications."
+        "message": "Resume uploaded! I can now calculate your job match score."
     }
 
 
 @app.get("/resume-status")
 def resume_status(session_id: str = "default"):
-    """Check if a resume has been uploaded for this session"""
     has_resume = session_id in user_resumes
     return {
         "has_resume": has_resume,
-        "message": "Resume is uploaded and ready!" if has_resume else "No resume uploaded yet."
+        "message": "Resume ready!" if has_resume else "No resume uploaded yet."
     }
 
 
 @app.delete("/resume")
 def delete_resume(session_id: str = "default"):
-    """Clear the uploaded resume for this session"""
     if session_id in user_resumes:
         del user_resumes[session_id]
     return {"message": "Resume cleared."}
@@ -166,7 +144,7 @@ def chat(body: ChatMessage):
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=(
-            "You are Mimi, a helpful AI assistant. "
+            "You are Mimi, a helpful AI assistant built by Mrudula. "
             "You help users with data analysis, job applications, SQL queries, "
             "file summarization, and general questions. "
             "Always refer to yourself as Mimi. "
@@ -194,7 +172,7 @@ def chat(body: ChatMessage):
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+        raise HTTPException(status_code=400, detail="Only CSV files supported")
 
     contents = await file.read()
     df = pd.read_csv(io.StringIO(contents.decode("utf-8")))
@@ -211,10 +189,7 @@ async def upload_file(file: UploadFile = File(...)):
         f"Statistics:\n{df.describe().round(2).to_dict()}"
     )
 
-    conversation_history.append({
-        "role": "user",
-        "content": f"[System: {data_context}]"
-    })
+    conversation_history.append({"role": "user", "content": f"[System: {data_context}]"})
     conversation_history.append({
         "role": "assistant",
         "content": (
@@ -250,7 +225,7 @@ async def summarize_file(file: UploadFile = File(...)):
         max_tokens=512,
         messages=[{
             "role": "user",
-            "content": f"Summarize this document in plain text with no markdown:\n\n{text}"
+            "content": f"Summarize this in plain text no markdown:\n\n{text}"
         }]
     )
 
@@ -285,52 +260,45 @@ def natural_language_to_sql(body: SQLQuery):
 
 
 # ─────────────────────────────────────────────
-# 9. Job scraper + match score
+# 9. Job scraper (simple — no browser needed)
 # ─────────────────────────────────────────────
-@app.post("/scrape-job")
-async def scrape_job(body: JobURL):
-    """
-    Scrape a job posting URL.
-    If user has uploaded a resume, calculate personal match score.
-    If no resume, just return job details and ask if they want to upload.
-    """
-    try:
-        from playwright.async_api import async_playwright
-        from bs4 import BeautifulSoup
+def scrape_with_requests(url: str) -> str:
+    """Simple HTTP scraper — works on most job sites except LinkedIn"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    response = requests.get(url, headers=headers, timeout=15)
+    response.raise_for_status()
 
-        # Scrape the job page
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.set_extra_http_headers({
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-                )
-            })
-            await page.goto(body.url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-            html = await page.content()
-            await browser.close()
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
 
-        soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    # Clean up excessive whitespace
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    return "\n".join(lines)[:6000]
 
-        job_text = soup.get_text(separator="\n", strip=True)[:6000]
 
-        # Check if user has a resume
-        has_resume = body.session_id in user_resumes
-        resume_section = ""
-        if has_resume:
-            resume_text = user_resumes[body.session_id][:3000]
-            resume_section = f"\n\nUSER RESUME:\n{resume_text}"
+def analyze_job_with_claude(job_text: str, session_id: str) -> dict:
+    """Use Claude to extract job details and calculate match score"""
+    has_resume = session_id in user_resumes
+    resume_section = ""
 
-        # Build prompt based on whether resume exists
-        if has_resume:
-            prompt = f"""
-Analyze this job posting and the user resume below.
-Return ONLY a valid JSON object with no extra text.
+    if has_resume:
+        resume_text = user_resumes[session_id][:3000]
+        resume_section = f"\n\nUSER RESUME:\n{resume_text}"
+
+    if has_resume:
+        prompt = f"""
+Analyze this job posting and the user resume.
+Return ONLY a valid JSON object with no extra text or markdown.
 
 JOB POSTING:
 {job_text}
@@ -340,15 +308,15 @@ Return exactly this JSON:
 {{
   "job_title": "job title",
   "company": "company name",
-  "location": "location",
+  "location": "location or Remote",
   "job_type": "full-time or part-time or contract or internship",
-  "summary": "2 sentence summary of the role in plain text",
+  "summary": "2 sentence plain text summary of the role",
   "required_skills": ["skill1", "skill2", "skill3", "skill4", "skill5"],
   "responsibilities": ["task1", "task2", "task3", "task4"],
   "match_score": 75,
   "matched_skills": ["skill1", "skill2", "skill3"],
   "missing_skills": ["skill4", "skill5"],
-  "match_summary": "2 sentence explanation of match score in plain text",
+  "match_summary": "2 sentence plain text explanation of the match score",
   "recommendation": "Strong Match",
   "has_resume": true,
   "form_fields": {{
@@ -358,12 +326,12 @@ Return exactly this JSON:
     "location": "extracted from resume"
   }}
 }}
-For recommendation use: Strong Match, Good Match, Partial Match, or Weak Match
+For recommendation use exactly: Strong Match, Good Match, Partial Match, or Weak Match
 """
-        else:
-            prompt = f"""
+    else:
+        prompt = f"""
 Analyze this job posting.
-Return ONLY a valid JSON object with no extra text.
+Return ONLY a valid JSON object with no extra text or markdown.
 
 JOB POSTING:
 {job_text}
@@ -372,15 +340,15 @@ Return exactly this JSON:
 {{
   "job_title": "job title",
   "company": "company name",
-  "location": "location",
+  "location": "location or Remote",
   "job_type": "full-time or part-time or contract or internship",
-  "summary": "2 sentence summary of the role in plain text",
+  "summary": "2 sentence plain text summary of the role",
   "required_skills": ["skill1", "skill2", "skill3", "skill4", "skill5"],
   "responsibilities": ["task1", "task2", "task3", "task4"],
   "match_score": null,
   "matched_skills": [],
   "missing_skills": [],
-  "match_summary": "Upload your resume to see your personal match score",
+  "match_summary": "Upload your resume to see your personal match score for this job.",
   "recommendation": "Upload Resume for Match Score",
   "has_resume": false,
   "form_fields": {{
@@ -392,30 +360,81 @@ Return exactly this JSON:
 }}
 """
 
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            messages=[{"role": "user", "content": prompt}]
-        )
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
 
-        raw = response.content[0].text.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        job_data = json.loads(raw)
+    raw = response.content[0].text.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw)
+
+
+@app.post("/scrape-job")
+async def scrape_job(body: JobURL):
+    """
+    Scrape a job posting URL using simple HTTP request.
+    Works on: Indeed, Glassdoor, Greenhouse, Lever, Workday, company sites.
+    For LinkedIn: ask user to paste job description text instead.
+    """
+    try:
+        # Check if LinkedIn URL
+        if "linkedin.com" in body.url:
+            return {
+                "success": False,
+                "linkedin": True,
+                "message": (
+                    "LinkedIn blocks automated scraping. "
+                    "Please copy and paste the job description text "
+                    "into the chat and I will analyze it for you!"
+                )
+            }
+
+        job_text = scrape_with_requests(body.url)
+
+        if len(job_text) < 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract enough content from this URL. Try pasting the job description text instead."
+            )
+
+        job_data = analyze_job_with_claude(job_text, body.session_id)
 
         return {"success": True, "url": body.url, "data": job_data}
 
     except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to parse job data. Try another URL.")
+        raise HTTPException(status_code=500, detail="Failed to parse job data. Try pasting the job description text instead.")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Could not access this URL: {str(e)}. Try pasting the job description text.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to scrape job: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze job: {str(e)}")
+
+
+@app.post("/analyze-job-text")
+async def analyze_job_text(body: JobText):
+    """
+    Analyze job description pasted as text.
+    Works for LinkedIn and any site that blocks scraping.
+    """
+    try:
+        if len(body.text) < 50:
+            raise HTTPException(status_code=400, detail="Please paste more job description text.")
+
+        job_data = analyze_job_with_claude(body.text, body.session_id)
+        return {"success": True, "data": job_data}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse job data. Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to analyze: {str(e)}")
 
 
 # ─────────────────────────────────────────────
-# 10. Cover letter generator
+# 10. Cover letter
 # ─────────────────────────────────────────────
 @app.post("/cover-letter")
 def generate_cover_letter(body: CoverLetterRequest):
-    """Generate a tailored cover letter using resume if available"""
     resume_section = ""
     if body.session_id in user_resumes:
         resume_section = f"\n\nUser Resume:\n{user_resumes[body.session_id][:2000]}"
